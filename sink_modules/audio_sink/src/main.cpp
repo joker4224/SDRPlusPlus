@@ -167,7 +167,7 @@ public:
     }
 
 #if RTAUDIO_VERSION_MAJOR >= 6
-    static void errorCallback(RtAudioErrorType type, const std::string& errorText) {
+    static void errorCallback(RtAudioErrorType type, const std::string& errorText) noexcept {
         switch (type) {
         case RtAudioErrorType::RTAUDIO_NO_ERROR:
             return;
@@ -177,7 +177,13 @@ public:
             flog::warn("AudioSinkModule Warning: {} ({})", errorText, (int)type);
             break;
         default:
-            throw std::runtime_error(errorText);
+            // RtAudio can invoke this callback from its realtime worker thread.
+            // Letting an exception escape that thread calls std::terminate(), which
+            // appears on Windows as the fast-fail status 0xC0000409.  Device state
+            // changes (for example a HDMI/DP endpoint disappearing when a display
+            // powers down) must therefore be reported without throwing here.
+            flog::error("AudioSinkModule Error: {} ({})", errorText, (int)type);
+            break;
         }
     }
 #endif
@@ -194,8 +200,17 @@ private:
 
         try {
             audio.openStream(&parameters, NULL, RTAUDIO_FLOAT32, sampleRate, &bufferFrames, &callback, this, &opts);
+            if (!audio.isStreamOpen()) {
+                flog::error("Could not open audio device: RtAudio did not open a stream");
+                return false;
+            }
             stereoPacker.setSampleCount(bufferFrames);
             audio.startStream();
+            if (!audio.isStreamRunning()) {
+                flog::error("Could not start audio device: RtAudio stream is not running");
+                audio.closeStream();
+                return false;
+            }
             stereoPacker.start();
         }
         catch (const std::exception& e) {
