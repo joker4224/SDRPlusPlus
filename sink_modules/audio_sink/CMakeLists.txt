@@ -12,7 +12,8 @@ if (MSVC)
     # Misc headers
     target_include_directories(audio_sink PRIVATE "C:/Program Files (x86)/RtAudio/include/rtaudio")
 
-    target_link_libraries(audio_sink PRIVATE rtaudio)
+    # recoveryWorker initializes COM before re-enumerating WASAPI endpoints.
+    target_link_libraries(audio_sink PRIVATE rtaudio ole32)
 else (MSVC)
     find_package(PkgConfig)
 

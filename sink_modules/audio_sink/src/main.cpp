@@ -9,6 +9,15 @@
 #include <RtAudio.h>
 #include <config.h>
 #include <core.h>
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <mutex>
+#include <thread>
+#if defined(_WIN32)
+#include <windows.h>
+#include <objbase.h>
+#endif
 
 #define CONCAT(a, b) ((std::string(a) + b).c_str())
 
@@ -32,7 +41,9 @@ public:
         stereoPacker.init(_stream->sinkOut, 512);
 
 #if RTAUDIO_VERSION_MAJOR >= 6
-        audio.setErrorCallback(&errorCallback);
+        audio.setErrorCallback([this](RtAudioErrorType type, const std::string& errorText) noexcept {
+            handleError(type, errorText);
+        });
 #endif
 
         bool created = false;
@@ -70,21 +81,37 @@ public:
             }
         }
         selectByName(device);
+        recoveryRequested.store(false);
+        recoveryThread = std::thread(&AudioSink::recoveryWorker, this);
     }
 
     ~AudioSink() {
-        stop();
+        recoveryStop.store(true);
+        recoveryWake.notify_all();
+        if (recoveryThread.joinable()) { recoveryThread.join(); }
+
+        std::lock_guard<std::mutex> lck(controlMtx);
+        running = false;
+        doStop();
     }
 
     void start() {
+        std::lock_guard<std::mutex> lck(controlMtx);
         if (running) { return; }
-        running = doStart();
+        running = true;
+        if (!doStart()) {
+            flog::warn("Audio output is unavailable; automatic recovery has been scheduled");
+            recoveryRequested.store(true);
+            recoveryWake.notify_all();
+        }
     }
 
     void stop() {
+        std::lock_guard<std::mutex> lck(controlMtx);
         if (!running) { return; }
-        doStop();
         running = false;
+        recoveryRequested.store(false);
+        doStop();
     }
 
     void selectFirst() {
@@ -102,6 +129,9 @@ public:
     }
 
     void selectById(int id) {
+        std::lock_guard<std::mutex> lck(controlMtx);
+        if (id < 0 || id >= devList.size()) { return; }
+
         devId = id;
         bool created = false;
         config.acquire();
@@ -137,43 +167,77 @@ public:
 
         _stream->setSampleRate(sampleRate);
 
-        if (running) { doStop(); }
-        if (running) { doStart(); }
+        if (running) {
+            doStop();
+            if (!doStart()) {
+                recoveryRequested.store(true);
+                recoveryWake.notify_all();
+            }
+        }
     }
 
     void menuHandler() {
         float menuWidth = ImGui::GetContentRegionAvail().x;
 
         ImGui::SetNextItemWidth(menuWidth);
-        if (ImGui::Combo(("##_audio_sink_dev_" + _streamName).c_str(), &devId, txtDevList.c_str())) {
-            selectById(devId);
+        int selectedDevId;
+        {
+            std::lock_guard<std::mutex> lck(controlMtx);
+            selectedDevId = devId;
+        }
+        if (ImGui::Combo(("##_audio_sink_dev_" + _streamName).c_str(), &selectedDevId, txtDevList.c_str())) {
+            selectById(selectedDevId);
+            std::string selectedDeviceName;
+            {
+                std::lock_guard<std::mutex> lck(controlMtx);
+                selectedDeviceName = devList[selectedDevId].name;
+            }
             config.acquire();
-            config.conf[_streamName]["device"] = devList[devId].name;
+            config.conf[_streamName]["device"] = selectedDeviceName;
             config.release(true);
         }
 
         ImGui::SetNextItemWidth(menuWidth);
-        if (ImGui::Combo(("##_audio_sink_sr_" + _streamName).c_str(), &srId, sampleRatesTxt.c_str())) {
-            sampleRate = sampleRates[srId];
-            _stream->setSampleRate(sampleRate);
-            if (running) {
-                doStop();
-                doStart();
+        int selectedSrId;
+        {
+            std::lock_guard<std::mutex> lck(controlMtx);
+            selectedSrId = srId;
+        }
+        if (ImGui::Combo(("##_audio_sink_sr_" + _streamName).c_str(), &selectedSrId, sampleRatesTxt.c_str())) {
+            unsigned int selectedSampleRate;
+            std::string selectedDeviceName;
+            {
+                std::lock_guard<std::mutex> lck(controlMtx);
+                srId = selectedSrId;
+                sampleRate = sampleRates[srId];
+                selectedSampleRate = sampleRate;
+                selectedDeviceName = devList[devId].name;
+                _stream->setSampleRate(sampleRate);
+                if (running) {
+                    doStop();
+                    if (!doStart()) {
+                        recoveryRequested.store(true);
+                        recoveryWake.notify_all();
+                    }
+                }
             }
             config.acquire();
-            config.conf[_streamName]["devices"][devList[devId].name] = sampleRate;
+            config.conf[_streamName]["devices"][selectedDeviceName] = selectedSampleRate;
             config.release(true);
         }
     }
 
 #if RTAUDIO_VERSION_MAJOR >= 6
-    static void errorCallback(RtAudioErrorType type, const std::string& errorText) noexcept {
+    void handleError(RtAudioErrorType type, const std::string& errorText) noexcept {
         switch (type) {
         case RtAudioErrorType::RTAUDIO_NO_ERROR:
             return;
         case RtAudioErrorType::RTAUDIO_WARNING:
+            flog::warn("AudioSinkModule Warning: {} ({})", errorText, (int)type);
+            break;
         case RtAudioErrorType::RTAUDIO_NO_DEVICES_FOUND:
         case RtAudioErrorType::RTAUDIO_DEVICE_DISCONNECT:
+            recoveryRequested.store(true);
             flog::warn("AudioSinkModule Warning: {} ({})", errorText, (int)type);
             break;
         default:
@@ -182,6 +246,7 @@ public:
             // appears on Windows as the fast-fail status 0xC0000409.  Device state
             // changes (for example a HDMI/DP endpoint disappearing when a display
             // powers down) must therefore be reported without throwing here.
+            recoveryRequested.store(true);
             flog::error("AudioSinkModule Error: {} ({})", errorText, (int)type);
             break;
         }
@@ -189,7 +254,39 @@ public:
 #endif
 
 private:
+    bool refreshSelectedDevice() {
+        if (devId < 0 || devId >= devList.size()) { return false; }
+
+        const std::string selectedName = devList[devId].name;
+        try {
+#if RTAUDIO_VERSION_MAJOR >= 6
+            for (int id : audio.getDeviceIds()) {
+#else
+            int count = audio.getDeviceCount();
+            for (int id = 0; id < count; id++) {
+#endif
+                RtAudio::DeviceInfo info = audio.getDeviceInfo(id);
+#if !defined(RTAUDIO_VERSION_MAJOR) || RTAUDIO_VERSION_MAJOR < 6
+                if (!info.probed) { continue; }
+#endif
+                if (info.outputChannels == 0 || info.name != selectedName) { continue; }
+
+                deviceIds[devId] = id;
+                devList[devId] = info;
+                return true;
+            }
+        }
+        catch (const std::exception& e) {
+            flog::warn("Could not refresh audio devices: {}", e.what());
+        }
+        return false;
+    }
+
     bool doStart() {
+        streamActive = false;
+        audioOpened = false;
+        if (!refreshSelectedDevice()) { return false; }
+
         RtAudio::StreamParameters parameters;
         parameters.deviceId = deviceIds[devId];
         parameters.nChannels = 2;
@@ -200,7 +297,8 @@ private:
 
         try {
             audio.openStream(&parameters, NULL, RTAUDIO_FLOAT32, sampleRate, &bufferFrames, &callback, this, &opts);
-            if (!audio.isStreamOpen()) {
+            audioOpened = audio.isStreamOpen();
+            if (!audioOpened) {
                 flog::error("Could not open audio device: RtAudio did not open a stream");
                 return false;
             }
@@ -209,12 +307,16 @@ private:
             if (!audio.isStreamRunning()) {
                 flog::error("Could not start audio device: RtAudio stream is not running");
                 audio.closeStream();
+                audioOpened = false;
                 return false;
             }
             stereoPacker.start();
+            streamActive = true;
         }
         catch (const std::exception& e) {
             flog::error("Could not open audio device {0}", e.what());
+            if (audioOpened) { audio.closeStream(); }
+            audioOpened = false;
             return false;
         }
 
@@ -223,15 +325,77 @@ private:
     }
 
     void doStop() {
-        s2m.stop();
-        monoPacker.stop();
-        stereoPacker.stop();
-        monoPacker.out.stopReader();
-        stereoPacker.out.stopReader();
-        audio.stopStream();
-        audio.closeStream();
-        monoPacker.out.clearReadStop();
-        stereoPacker.out.clearReadStop();
+        if (streamActive) {
+            s2m.stop();
+            monoPacker.stop();
+            stereoPacker.stop();
+            monoPacker.out.stopReader();
+            stereoPacker.out.stopReader();
+        }
+
+        try {
+            // closeStream() stops a running stream itself.  Avoid querying the
+            // RtAudio state from this thread while its WASAPI worker is changing
+            // that state after a device-disconnect notification.
+            if (audioOpened) { audio.closeStream(); }
+        }
+        catch (const std::exception& e) {
+            flog::error("Could not close audio device: {}", e.what());
+        }
+        audioOpened = false;
+
+        if (streamActive) {
+            monoPacker.out.clearReadStop();
+            stereoPacker.out.clearReadStop();
+        }
+        streamActive = false;
+    }
+
+    void recoveryWorker() {
+#if defined(_WIN32)
+        // RtAudio's WASAPI backend uses COM while enumerating and opening
+        // endpoints.  Recovery runs on this worker, so initialize COM here as
+        // well (the original RtAudio object was constructed on the UI thread).
+        HRESULT comResult = CoInitializeEx(NULL, COINIT_MULTITHREADED);
+        bool comInitialized = SUCCEEDED(comResult);
+#endif
+
+        bool recovering = false;
+        std::unique_lock<std::mutex> waitLock(recoveryWaitMtx);
+
+        while (!recoveryStop.load()) {
+            recoveryWake.wait_for(waitLock, std::chrono::seconds(1));
+            if (recoveryStop.load()) { break; }
+            if (!recoveryRequested.exchange(false)) { continue; }
+
+            waitLock.unlock();
+            {
+                std::lock_guard<std::mutex> lck(controlMtx);
+                if (!running) {
+                    recovering = false;
+                }
+                else {
+                    if (!recovering) {
+                        flog::warn("Audio output stream stopped; waiting for the device to return");
+                        recovering = true;
+                    }
+
+                    doStop();
+                    if (doStart()) {
+                        flog::info("Audio output stream recovered");
+                        recovering = false;
+                    }
+                    else {
+                        recoveryRequested.store(true);
+                    }
+                }
+            }
+            waitLock.lock();
+        }
+
+#if defined(_WIN32)
+        if (comInitialized) { CoUninitialize(); }
+#endif
     }
 
     static int callback(void* outputBuffer, void* inputBuffer, unsigned int nBufferFrames, double streamTime, RtAudioStreamStatus status, void* userData) {
@@ -255,6 +419,15 @@ private:
     int devCount;
     int devId = 0;
     bool running = false;
+    bool streamActive = false;
+    bool audioOpened = false;
+
+    std::mutex controlMtx;
+    std::mutex recoveryWaitMtx;
+    std::condition_variable recoveryWake;
+    std::atomic<bool> recoveryStop = false;
+    std::thread recoveryThread;
+    std::atomic<bool> recoveryRequested = false;
 
     unsigned int defaultDevId = 0;
 
