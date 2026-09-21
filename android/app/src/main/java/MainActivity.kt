@@ -13,8 +13,16 @@ import android.hardware.usb.*;
 import android.Manifest;
 import android.os.Bundle;
 import android.view.View;
+import android.view.ViewGroup;
 import android.view.KeyEvent;
+import android.view.inputmethod.BaseInputConnection;
+import android.view.inputmethod.EditorInfo;
+import android.view.inputmethod.InputConnection;
+import android.view.inputmethod.InputConnectionWrapper;
 import android.view.inputmethod.InputMethodManager;
+import android.widget.EditText;
+import android.widget.FrameLayout;
+import android.graphics.Color;
 import android.util.Log;
 import android.content.res.AssetManager;
 
@@ -60,6 +68,46 @@ class MainActivity : NativeActivity() {
     public var SDR_VID : Int = -1;
     public var SDR_PID : Int = -1;
     public var SDR_FD : Int = -1;
+    private lateinit var imeInput: EditText;
+
+    // NativeActivity only forwards key events. An IME sends composed words through
+    // InputConnection instead, so give it an editor and forward committed text.
+    private inner class ImeInput(context: Context) : EditText(context) {
+        override fun onCreateInputConnection(outAttrs: EditorInfo): InputConnection? {
+            val connection = super.onCreateInputConnection(outAttrs) ?: return null
+            return object : InputConnectionWrapper(connection, true) {
+                override fun commitText(text: CharSequence, newCursorPosition: Int): Boolean {
+                    val result = super.commitText(text, newCursorPosition)
+                    if (result) queueText(text)
+                    return result
+                }
+
+                override fun finishComposingText(): Boolean {
+                    val editable = this@ImeInput.text
+                    val start = BaseInputConnection.getComposingSpanStart(editable)
+                    val end = BaseInputConnection.getComposingSpanEnd(editable)
+                    val committed = if (start >= 0 && end > start) editable.subSequence(start, end).toString() else ""
+                    val result = super.finishComposingText()
+                    if (result) queueText(committed)
+                    return result
+                }
+
+                override fun deleteSurroundingText(beforeLength: Int, afterLength: Int): Boolean {
+                    val composing = BaseInputConnection.getComposingSpanStart(this@ImeInput.text) >= 0
+                    val result = super.deleteSurroundingText(beforeLength, afterLength)
+                    if (result && !composing) {
+                        repeat(beforeLength.coerceAtMost(1024)) { unicodeCharacterQueue.offer(-1) }
+                        repeat(afterLength.coerceAtMost(1024)) { unicodeCharacterQueue.offer(-2) }
+                    }
+                    return result
+                }
+            }
+        }
+    }
+
+    private fun queueText(text: CharSequence) {
+        text.toString().codePoints().forEach { unicodeCharacterQueue.offer(it) }
+    }
 
     fun checkAndAsk(permission: String) {
         if (PermissionChecker.checkSelfPermission(this, permission) != PackageManager.PERMISSION_GRANTED) {
@@ -99,6 +147,24 @@ class MainActivity : NativeActivity() {
         checkAndAsk(Manifest.permission.INTERNET);
 
         super.onCreate(savedInstanceState)
+
+        // Keep the native surface visible while the IME has a real text editor to focus.
+        imeInput = ImeInput(this).apply {
+            setSingleLine(true)
+            imeOptions = EditorInfo.IME_ACTION_DONE or EditorInfo.IME_FLAG_NO_EXTRACT_UI
+            setBackgroundColor(Color.TRANSPARENT)
+            setTextColor(Color.TRANSPARENT)
+            setCursorVisible(false)
+            alpha = 0f
+            setShowSoftInputOnFocus(false)
+            setOnEditorActionListener { _, actionId, _ ->
+                if (actionId == EditorInfo.IME_ACTION_DONE) {
+                    unicodeCharacterQueue.offer(-3)
+                    true
+                } else false
+            }
+        }
+        (window.decorView as ViewGroup).addView(imeInput, FrameLayout.LayoutParams(1, 1))
     }
 
     public override fun onResume() {
@@ -108,14 +174,21 @@ class MainActivity : NativeActivity() {
     }
 
     fun showSoftInput() {
-        val inputMethodManager = getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager;
-        inputMethodManager.showSoftInput(window.decorView, 0);
+        runOnUiThread {
+            imeInput.text.clear()
+            imeInput.requestFocus()
+            val inputMethodManager = getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
+            inputMethodManager.showSoftInput(imeInput, InputMethodManager.SHOW_IMPLICIT)
+        }
     }
 
     fun hideSoftInput() {
-        val inputMethodManager = getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager;
-        inputMethodManager.hideSoftInputFromWindow(window.decorView.windowToken, 0);
-        hideSystemBars();
+        runOnUiThread {
+            val inputMethodManager = getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
+            inputMethodManager.hideSoftInputFromWindow(imeInput.windowToken, 0)
+            imeInput.clearFocus()
+            hideSystemBars()
+        }
     }
 
     // Queue for the Unicode characters to be polled from native code (via pollUnicodeChar())
@@ -125,7 +198,19 @@ class MainActivity : NativeActivity() {
     // KeyEvent and not consumed by any View before it reaches here
     override fun dispatchKeyEvent(event: KeyEvent): Boolean {
         if (event.action == KeyEvent.ACTION_DOWN) {
-            unicodeCharacterQueue.offer(event.getUnicodeChar(event.metaState))
+            if (::imeInput.isInitialized && imeInput.hasFocus()) {
+                when (event.keyCode) {
+                    KeyEvent.KEYCODE_DEL -> unicodeCharacterQueue.offer(-1)
+                    KeyEvent.KEYCODE_FORWARD_DEL -> unicodeCharacterQueue.offer(-2)
+                    KeyEvent.KEYCODE_ENTER -> unicodeCharacterQueue.offer(-3)
+                    KeyEvent.KEYCODE_DPAD_LEFT -> unicodeCharacterQueue.offer(-4)
+                    KeyEvent.KEYCODE_DPAD_RIGHT -> unicodeCharacterQueue.offer(-5)
+                }
+            }
+            val unicode = event.getUnicodeChar(event.metaState)
+            if (unicode > 0 && unicode != '\n'.toInt() && unicode != '\b'.toInt()) {
+                unicodeCharacterQueue.offer(unicode)
+            }
         }
         return super.dispatchKeyEvent(event)
     }

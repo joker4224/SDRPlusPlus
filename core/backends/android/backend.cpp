@@ -30,7 +30,7 @@ namespace backend {
     bool exited = false;
 
     // Forward declaration
-    int ShowSoftKeyboardInput();
+    int SetSoftKeyboardInput(bool visible);
     int PollUnicodeChars();
 
     void doPartialInit() {
@@ -206,7 +206,9 @@ namespace backend {
                 // Open on-screen (soft) input if requested by Dear ImGui
                 static bool WantTextInputLast = false;
                 if (io.WantTextInput && !WantTextInputLast)
-                ShowSoftKeyboardInput();
+                    SetSoftKeyboardInput(true);
+                else if (!io.WantTextInput && WantTextInputLast)
+                    SetSoftKeyboardInput(false);
                 WantTextInputLast = io.WantTextInput;
 
                 // Render
@@ -250,7 +252,7 @@ namespace backend {
         return 0;
     }
 
-    int ShowSoftKeyboardInput() {
+    int SetSoftKeyboardInput(bool visible) {
         JavaVM* java_vm = app->activity->vm;
         JNIEnv* java_env = NULL;
 
@@ -258,25 +260,25 @@ namespace backend {
         if (jni_return == JNI_ERR)
             return -1;
 
-        jni_return = java_vm->AttachCurrentThread(&java_env, NULL);
-        if (jni_return != JNI_OK)
+        bool attached = jni_return == JNI_EDETACHED;
+        if (attached && java_vm->AttachCurrentThread(&java_env, NULL) != JNI_OK)
             return -2;
 
         jclass native_activity_clazz = java_env->GetObjectClass(app->activity->clazz);
-        if (native_activity_clazz == NULL)
-            return -3;
+        int result = -3;
+        if (native_activity_clazz != NULL) {
+            const char* method_name = visible ? "showSoftInput" : "hideSoftInput";
+            jmethodID method_id = java_env->GetMethodID(native_activity_clazz, method_name, "()V");
+            if (method_id != NULL) {
+                java_env->CallVoidMethod(app->activity->clazz, method_id);
+                result = 0;
+            }
+            java_env->DeleteLocalRef(native_activity_clazz);
+        }
 
-        jmethodID method_id = java_env->GetMethodID(native_activity_clazz, "showSoftInput", "()V");
-        if (method_id == NULL)
-            return -4;
-
-        java_env->CallVoidMethod(app->activity->clazz, method_id);
-
-        jni_return = java_vm->DetachCurrentThread();
-        if (jni_return != JNI_OK)
-            return -5;
-
-        return 0;
+        if (attached)
+            java_vm->DetachCurrentThread();
+        return result;
     }
 
     int getDeviceFD(int& vid, int& pid, const std::vector<DevVIDPID>& allowedVidPids) {
@@ -350,8 +352,25 @@ namespace backend {
         // Send the actual characters to Dear ImGui
         ImGuiIO& io = ImGui::GetIO();
         jint unicode_character;
-        while ((unicode_character = java_env->CallIntMethod(app->activity->clazz, method_id)) != 0)
-            io.AddInputCharacter(unicode_character);
+        while ((unicode_character = java_env->CallIntMethod(app->activity->clazz, method_id)) != 0) {
+            if (unicode_character < 0) {
+                // Control keys sent by the focused Android IME editor.
+                ImGuiKey key = ImGuiKey_None;
+                switch (unicode_character) {
+                case -1: key = ImGuiKey_Backspace; break;
+                case -2: key = ImGuiKey_Delete; break;
+                case -3: key = ImGuiKey_Enter; break;
+                case -4: key = ImGuiKey_LeftArrow; break;
+                case -5: key = ImGuiKey_RightArrow; break;
+                }
+                if (key == ImGuiKey_None) { continue; }
+                io.AddKeyEvent(key, true);
+                io.AddKeyEvent(key, false);
+            }
+            else if (unicode_character > 0) {
+                io.AddInputCharacter(unicode_character);
+            }
+        }
 
         jni_return = java_vm->DetachCurrentThread();
         if (jni_return != JNI_OK)

@@ -45,9 +45,7 @@ namespace style {
         hugeBuilder.AddRanges(hugeRange);
         hugeBuilder.BuildRanges(&hugeRanges);
         
-        // Load the normal UI font first. On Windows, merge the Chinese glyphs
-        // from the system's Microsoft YaHei font into it. This keeps Roboto for
-        // the existing UI while allowing user-provided Chinese text to render.
+        // Keep Roboto for the UI and merge platform Chinese glyphs into it.
         baseFont = fonts->AddFontFromFileTTF(((std::string)(resDir + "/fonts/Roboto-Medium.ttf")).c_str(), 16.0f * uiScale, NULL, baseRanges.Data);
 
 #ifdef _WIN32
@@ -63,6 +61,30 @@ namespace style {
         }
         else {
             flog::warn("Chinese font not found: {0}", chineseFontPath.string());
+        }
+#elif defined(__ANDROID__)
+        // Android ships CJK fallback fonts outside the app's Roboto assets.
+        // Merge only the Chinese glyphs into the base font used by bookmarks.
+        struct ChineseFontCandidate { const char* path; int fontIndex; };
+        const ChineseFontCandidate chineseFonts[] = {
+            { "/system/fonts/NotoSansCJK-Regular.ttc", 2 }, // Simplified Chinese face
+            { "/system/fonts/NotoSansSC-Regular.otf", 0 },
+            { "/system/fonts/DroidSansFallback.ttf", 0 }
+        };
+        bool chineseFontLoaded = false;
+        for (const auto& candidate : chineseFonts) {
+            if (!std::filesystem::is_regular_file(candidate.path)) { continue; }
+            ImFontConfig chineseFontConfig;
+            chineseFontConfig.MergeMode = true;
+            chineseFontConfig.PixelSnapH = true;
+            chineseFontConfig.FontNo = candidate.fontIndex;
+            if (fonts->AddFontFromFileTTF(candidate.path, 16.0f * uiScale, &chineseFontConfig, fonts->GetGlyphRangesChineseSimplifiedCommon())) {
+                chineseFontLoaded = true;
+                break;
+            }
+        }
+        if (!chineseFontLoaded) {
+            flog::warn("No Android Chinese fallback font found");
         }
 #endif
 
