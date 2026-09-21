@@ -5,6 +5,7 @@
 #include <utils/flog.h>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
 
 namespace style {
     ImFont* baseFont;
@@ -74,10 +75,27 @@ namespace style {
         bool chineseFontLoaded = false;
         for (const auto& candidate : chineseFonts) {
             if (!std::filesystem::is_regular_file(candidate.path)) { continue; }
+            if (candidate.fontIndex > 0) {
+                // A vendor may ship a different collection under this name.
+                // ImGui asserts at atlas build time if FontNo is out of range.
+                unsigned char header[12];
+                std::ifstream fontFile(candidate.path, std::ios::binary);
+                if (!fontFile.read(reinterpret_cast<char*>(header), sizeof(header))) { continue; }
+                if (header[0] != 't' || header[1] != 't' || header[2] != 'c' || header[3] != 'f') { continue; }
+                unsigned int count = (static_cast<unsigned int>(header[8]) << 24)
+                                   | (static_cast<unsigned int>(header[9]) << 16)
+                                   | (static_cast<unsigned int>(header[10]) << 8)
+                                   | static_cast<unsigned int>(header[11]);
+                if (count <= static_cast<unsigned int>(candidate.fontIndex)) { continue; }
+            }
             ImFontConfig chineseFontConfig;
             chineseFontConfig.MergeMode = true;
             chineseFontConfig.PixelSnapH = true;
             chineseFontConfig.FontNo = candidate.fontIndex;
+            // At 3x UI scale the default 3x horizontal oversampling can
+            // produce an oversized font atlas and exhaust mobile GPU memory.
+            chineseFontConfig.OversampleH = 1;
+            chineseFontConfig.OversampleV = 1;
             if (fonts->AddFontFromFileTTF(candidate.path, 16.0f * uiScale, &chineseFontConfig, fonts->GetGlyphRangesChineseSimplifiedCommon())) {
                 chineseFontLoaded = true;
                 break;
