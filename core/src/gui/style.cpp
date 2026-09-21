@@ -47,7 +47,17 @@ namespace style {
         hugeBuilder.BuildRanges(&hugeRanges);
         
         // Keep Roboto for the UI and merge platform Chinese glyphs into it.
-        baseFont = fonts->AddFontFromFileTTF(((std::string)(resDir + "/fonts/Roboto-Medium.ttf")).c_str(), 16.0f * uiScale, NULL, baseRanges.Data);
+        const std::string robotoPath = resDir + "/fonts/Roboto-Medium.ttf";
+        auto addBaseFont = [&]() {
+            baseFont = fonts->AddFontFromFileTTF(robotoPath.c_str(), 16.0f * uiScale, NULL, baseRanges.Data);
+            return baseFont != nullptr;
+        };
+        auto addLargeFonts = [&]() {
+            bigFont = fonts->AddFontFromFileTTF(robotoPath.c_str(), 45.0f * uiScale, NULL, bigRanges.Data);
+            hugeFont = fonts->AddFontFromFileTTF(robotoPath.c_str(), 128.0f * uiScale, NULL, hugeRanges.Data);
+            return bigFont != nullptr && hugeFont != nullptr;
+        };
+        if (!addBaseFont()) { return false; }
 
 #ifdef _WIN32
         const char* windowsDir = std::getenv("WINDIR");
@@ -69,6 +79,8 @@ namespace style {
         struct ChineseFontCandidate { const char* path; int fontIndex; };
         const ChineseFontCandidate chineseFonts[] = {
             { "/system/fonts/NotoSansCJK-Regular.ttc", 2 }, // Simplified Chinese face
+            { "/system/fonts/MiSansVF.ttf", 0 },            // Xiaomi system Chinese font
+            { "/system/fonts/NotoSerifCJK-Regular.ttc", 2 },
             { "/system/fonts/NotoSansSC-Regular.otf", 0 },
             { "/system/fonts/DroidSansFallback.ttf", 0 }
         };
@@ -97,18 +109,33 @@ namespace style {
             chineseFontConfig.OversampleH = 1;
             chineseFontConfig.OversampleV = 1;
             if (fonts->AddFontFromFileTTF(candidate.path, 16.0f * uiScale, &chineseFontConfig, fonts->GetGlyphRangesChineseSimplifiedCommon())) {
+                if (!addLargeFonts()) { return false; }
+                // AddFontFromFileTTF only reads the file; unsupported vendor font
+                // tables are rejected when ImGui builds the atlas. Verify now,
+                // before the loading screen's first ImGui::NewFrame().
+                if (!fonts->Build() || !baseFont->FindGlyphNoFallback(0x4E2D)) {
+                    flog::warn("Cannot build Chinese glyphs from {0}; trying another font", candidate.path);
+                    fonts->Clear();
+                    if (!addBaseFont()) { return false; }
+                    continue;
+                }
                 chineseFontLoaded = true;
                 break;
             }
         }
         if (!chineseFontLoaded) {
-            flog::warn("No Android Chinese fallback font found");
+            flog::warn("No compatible Android Chinese fallback font found");
+            if (!addLargeFonts() || !fonts->Build()) {
+                flog::error("Failed to build Android Roboto font atlas");
+                return false;
+            }
         }
 #endif
 
-        // Add bigger fonts for frequency select and title
-        bigFont = fonts->AddFontFromFileTTF(((std::string)(resDir + "/fonts/Roboto-Medium.ttf")).c_str(), 45.0f * uiScale, NULL, bigRanges.Data);
-        hugeFont = fonts->AddFontFromFileTTF(((std::string)(resDir + "/fonts/Roboto-Medium.ttf")).c_str(), 128.0f * uiScale, NULL, hugeRanges.Data);
+#ifndef __ANDROID__
+        // Add bigger fonts for frequency select and title.
+        if (!addLargeFonts()) { return false; }
+#endif
 
         return true;
     }
