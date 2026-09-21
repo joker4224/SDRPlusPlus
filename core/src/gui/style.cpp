@@ -3,6 +3,7 @@
 #include <imgui_internal.h>
 #include <config.h>
 #include <utils/flog.h>
+#include <cstdlib>
 #include <filesystem>
 
 namespace style {
@@ -44,8 +45,28 @@ namespace style {
         hugeBuilder.AddRanges(hugeRange);
         hugeBuilder.BuildRanges(&hugeRanges);
         
-        // Add bigger fonts for frequency select and title
+        // Load the normal UI font first. On Windows, merge the Chinese glyphs
+        // from the system's Microsoft YaHei font into it. This keeps Roboto for
+        // the existing UI while allowing user-provided Chinese text to render.
         baseFont = fonts->AddFontFromFileTTF(((std::string)(resDir + "/fonts/Roboto-Medium.ttf")).c_str(), 16.0f * uiScale, NULL, baseRanges.Data);
+
+#ifdef _WIN32
+        const char* windowsDir = std::getenv("WINDIR");
+        std::filesystem::path chineseFontPath = std::filesystem::path(windowsDir ? windowsDir : "C:/Windows") / "Fonts/msyh.ttc";
+        if (std::filesystem::is_regular_file(chineseFontPath)) {
+            ImFontConfig chineseFontConfig;
+            chineseFontConfig.MergeMode = true;
+            chineseFontConfig.PixelSnapH = true;
+            if (!fonts->AddFontFromFileTTF(chineseFontPath.string().c_str(), 16.0f * uiScale, &chineseFontConfig, fonts->GetGlyphRangesChineseSimplifiedCommon())) {
+                flog::warn("Failed to load Chinese font: {0}", chineseFontPath.string());
+            }
+        }
+        else {
+            flog::warn("Chinese font not found: {0}", chineseFontPath.string());
+        }
+#endif
+
+        // Add bigger fonts for frequency select and title
         bigFont = fonts->AddFontFromFileTTF(((std::string)(resDir + "/fonts/Roboto-Medium.ttf")).c_str(), 45.0f * uiScale, NULL, bigRanges.Data);
         hugeFont = fonts->AddFontFromFileTTF(((std::string)(resDir + "/fonts/Roboto-Medium.ttf")).c_str(), 128.0f * uiScale, NULL, hugeRanges.Data);
 
