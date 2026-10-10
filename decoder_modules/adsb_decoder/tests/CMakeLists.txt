@@ -1,0 +1,13 @@
+cmake_minimum_required(VERSION 3.13)
+project(adsb_decoder_tests LANGUAGES CXX)
+
+enable_testing()
+add_executable(adsb_tests adsb_tests.cpp ../src/adsb/adsb.cpp)
+target_compile_features(adsb_tests PRIVATE cxx_std_17)
+target_include_directories(adsb_tests PRIVATE ../src)
+if(MSVC)
+    target_compile_options(adsb_tests PRIVATE /W4 /permissive- /EHsc)
+else()
+    target_compile_options(adsb_tests PRIVATE -Wall -Wextra -Wpedantic)
+endif()
+add_test(NAME adsb_core_and_stream COMMAND adsb_tests)

@@ -10,7 +10,7 @@ namespace style {
     SDRPP_EXPORT float uiScale;
 
     bool setDefaultStyle(std::string resDir);
-    bool loadFonts(std::string resDir);
+    bool loadFonts(std::string resDir, int maxTextureSize = 0);
     void beginDisabled();
     void endDisabled();
     void testtt();

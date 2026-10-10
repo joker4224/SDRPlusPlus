@@ -357,6 +357,7 @@ Modules in beta are still included in releases for the most part but not enabled
 
 | Name                | Stage      | Dependencies | Option                        | Built by default| Built in Release | Enabled in SDR++ by default |
 |---------------------|------------|--------------|-------------------------------|:---------------:|:----------------:|:---------------------------:|
+| [adsb_decoder](decoder_modules/adsb_decoder/README.md) | Basic / RF unverified | - | OPT_BUILD_ADSB_DECODER | ⛔ | ⛔ | ⛔ |
 | atv_decoder         | Unfinished | -            | OPT_BUILD_ATV_DECODER         | ⛔              | ⛔              | ⛔                         |
 | dab_decoder         | Unfinished | -            | OPT_BUILD_DAB_DECODER         | ⛔              | ⛔              | ⛔                         |
 | falcon9_decoder     | Unfinished | ffplay       | OPT_BUILD_FALCON9_DECODER     | ⛔              | ⛔              | ⛔                         |

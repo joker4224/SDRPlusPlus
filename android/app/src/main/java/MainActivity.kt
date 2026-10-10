@@ -12,6 +12,8 @@ import android.content.pm.PackageManager;
 import android.hardware.usb.*;
 import android.Manifest;
 import android.os.Bundle;
+import android.os.Build;
+import android.os.ParcelFileDescriptor;
 import android.view.View;
 import android.view.ViewGroup;
 import android.view.KeyEvent;
@@ -35,39 +37,23 @@ import java.io.*;
 
 private const val ACTION_USB_PERMISSION = "org.sdrpp.sdrpp.USB_PERMISSION";
 
-private val usbReceiver = object : BroadcastReceiver() {
-    override fun onReceive(context: Context, intent: Intent) {
-        if (ACTION_USB_PERMISSION == intent.action) {
-            synchronized(this) {
-                var _this = context as MainActivity;
-                _this.SDR_device = intent.getParcelableExtra(UsbManager.EXTRA_DEVICE)
-                if (intent.getBooleanExtra(UsbManager.EXTRA_PERMISSION_GRANTED, false)) {
-                    _this.SDR_conn = _this.usbManager!!.openDevice(_this.SDR_device);
-                    
-                    // Save SDR info
-                    _this.SDR_VID = _this.SDR_device!!.getVendorId();
-                    _this.SDR_PID = _this.SDR_device!!.getProductId()
-                    _this.SDR_FD = _this.SDR_conn!!.getFileDescriptor();
-                }
-                
-                // Whatever the hell this does
-                context.unregisterReceiver(this);
-
-                // Hide again the system bars
-                _this.hideSystemBars();
-            }
-        }
-    }
-}
-
 class MainActivity : NativeActivity() {
     private val TAG : String = "SDR++";
     public var usbManager : UsbManager? = null;
-    public var SDR_device : UsbDevice? = null;
-    public var SDR_conn : UsbDeviceConnection? = null;
-    public var SDR_VID : Int = -1;
-    public var SDR_PID : Int = -1;
-    public var SDR_FD : Int = -1;
+    private lateinit var devices: DeviceManager<UsbDevice, UsbDeviceConnection>
+    private var usbReceiverRegistered = false
+    private val usbReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent) {
+            val device = intent.getParcelableExtra<UsbDevice>(UsbManager.EXTRA_DEVICE) ?: return
+            when (intent.action) {
+                ACTION_USB_PERMISSION -> devices.permissionResult(device,
+                    intent.getBooleanExtra(UsbManager.EXTRA_PERMISSION_GRANTED, false))
+                UsbManager.ACTION_USB_DEVICE_DETACHED -> devices.detached(device)
+                UsbManager.ACTION_USB_DEVICE_ATTACHED -> devices.refresh()
+            }
+            hideSystemBars()
+        }
+    }
     private lateinit var imeInput: EditText;
 
     // NativeActivity only forwards key events. An IME sends composed words through
@@ -133,15 +119,32 @@ class MainActivity : NativeActivity() {
 
         // Register events
         usbManager = getSystemService(Context.USB_SERVICE) as UsbManager;
-        val permissionIntent = PendingIntent.getBroadcast(this, 0, Intent(ACTION_USB_PERMISSION), 0)
+        // UsbManager fills broadcast extras: Android 12+ needs FLAG_MUTABLE.
+        // Compile SDK 28 has no named constant, so use its documented value.
+        val flags = PendingIntent.FLAG_UPDATE_CURRENT or
+            (if (Build.VERSION.SDK_INT >= 31) 0x02000000 else 0)
+        val permissionIntent = PendingIntent.getBroadcast(this, 0,
+            Intent(ACTION_USB_PERMISSION).setPackage(packageName), flags)
+        devices = DeviceManager(
+            devices = { usbManager!!.deviceList.values.toList() },
+            key = { it.deviceName },
+            hasPermission = { usbManager!!.hasPermission(it) },
+            requestPermission = { device -> runOnUiThread {
+                try { usbManager!!.requestPermission(device, permissionIntent) }
+                catch (e: Exception) { devices.permissionResult(device, false); Log.e(TAG, "USB permission request failed", e) }
+            } },
+            open = { device ->
+                try { usbManager!!.openDevice(device) }
+                catch (e: Exception) { Log.e(TAG, "USB openDevice failed for ${device.deviceName}", e); null }
+            },
+            close = { it.close() },
+            valid = { it.fileDescriptor >= 0 }
+        )
         val filter = IntentFilter(ACTION_USB_PERMISSION)
+        filter.addAction(UsbManager.ACTION_USB_DEVICE_ATTACHED)
+        filter.addAction(UsbManager.ACTION_USB_DEVICE_DETACHED)
         registerReceiver(usbReceiver, filter)
-
-        // Get permission for all USB devices
-        val devList = usbManager!!.getDeviceList();
-        for ((name, dev) in devList) {
-            usbManager!!.requestPermission(dev, permissionIntent);
-        }
+        usbReceiverRegistered = true
 
         // Ask for internet permission
         checkAndAsk(Manifest.permission.INTERNET);
@@ -172,6 +175,37 @@ class MainActivity : NativeActivity() {
         hideSystemBars();
         super.onResume();
     }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        if (usbReceiverRegistered) {
+            unregisterReceiver(usbReceiver)
+            usbReceiverRegistered = false
+        }
+        devices.closeAll()
+    }
+
+    // JNI obtains one atomic snapshot. RTL-SDR requests an owned duplicate FD.
+    fun getUsbDeviceInfo(allowed: IntArray, duplicate: Boolean): IntArray {
+        return try {
+            devices.withDevice(
+                matches = { device -> allowed.isEmpty() || allowed.indices.step(2).any {
+                    it + 1 < allowed.size && allowed[it] == device.vendorId && allowed[it + 1] == device.productId
+                } },
+                use = { device, connection ->
+                    val fd = if (duplicate) ParcelFileDescriptor.fromFd(connection.fileDescriptor).detachFd()
+                        else connection.fileDescriptor
+                    intArrayOf(fd, device.vendorId, device.productId)
+                }
+            ) ?: intArrayOf(-1, -1, -1)
+        } catch (e: Exception) {
+            Log.e(TAG, "USB descriptor acquisition failed", e)
+            intArrayOf(-1, -1, -1)
+        }
+    }
+
+    fun refreshUsbDevices() { devices.refresh() }
+    fun getUsbStatus(): String = devices.getStatus()
 
     fun showSoftInput() {
         runOnUiThread {
@@ -232,7 +266,7 @@ class MainActivity : NativeActivity() {
     }
 
     public fun extractDir(aman: AssetManager, local: String, rsrc: String): Int {
-        val flist = aman.list(rsrc);
+        val flist = aman.list(rsrc) ?: emptyArray();
         var ecount = 0;
         for (fp in flist) {
             val lpath = local + "/" + fp;

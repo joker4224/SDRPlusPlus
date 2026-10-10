@@ -6,6 +6,8 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include "chinese_font.h"
+#include <algorithm>
 
 namespace style {
     ImFont* baseFont;
@@ -21,7 +23,7 @@ namespace style {
     float uiScale = 3.0f;
 #endif
 
-    bool loadFonts(std::string resDir) {
+    bool loadFonts(std::string resDir, int maxTextureSize) {
         ImFontAtlas* fonts = ImGui::GetIO().Fonts;
         if (!std::filesystem::is_directory(resDir)) {
             flog::error("Invalid resource directory: {0}", resDir);
@@ -66,7 +68,8 @@ namespace style {
             ImFontConfig chineseFontConfig;
             chineseFontConfig.MergeMode = true;
             chineseFontConfig.PixelSnapH = true;
-            if (!fonts->AddFontFromFileTTF(chineseFontPath.string().c_str(), 16.0f * uiScale, &chineseFontConfig, fonts->GetGlyphRangesChineseSimplifiedCommon())) {
+            chineseFontConfig.OversampleH = chineseFontConfig.OversampleV = 1;
+            if (!fonts->AddFontFromFileTTF(chineseFontPath.string().c_str(), 16.0f * uiScale, &chineseFontConfig, chineseGlyphRanges())) {
                 flog::warn("Failed to load Chinese font: {0}", chineseFontPath.string());
             }
         }
@@ -85,6 +88,8 @@ namespace style {
             { "/system/fonts/DroidSansFallback.ttf", 0 }
         };
         bool chineseFontLoaded = false;
+        fonts->Flags |= ImFontAtlasFlags_NoPowerOfTwoHeight;
+        fonts->TexDesiredWidth = maxTextureSize > 0 ? (std::min)(4096, maxTextureSize) : 4096;
         for (const auto& candidate : chineseFonts) {
             if (!std::filesystem::is_regular_file(candidate.path)) { continue; }
             if (candidate.fontIndex > 0) {
@@ -100,28 +105,31 @@ namespace style {
                                    | static_cast<unsigned int>(header[11]);
                 if (count <= static_cast<unsigned int>(candidate.fontIndex)) { continue; }
             }
-            ImFontConfig chineseFontConfig;
-            chineseFontConfig.MergeMode = true;
-            chineseFontConfig.PixelSnapH = true;
-            chineseFontConfig.FontNo = candidate.fontIndex;
-            // At 3x UI scale the default 3x horizontal oversampling can
-            // produce an oversized font atlas and exhaust mobile GPU memory.
-            chineseFontConfig.OversampleH = 1;
-            chineseFontConfig.OversampleV = 1;
-            if (fonts->AddFontFromFileTTF(candidate.path, 16.0f * uiScale, &chineseFontConfig, fonts->GetGlyphRangesChineseSimplifiedCommon())) {
+            for (float rasterSize : {24.0f, 20.0f, 16.0f, 12.0f}) {
+                rasterSize = (std::min)(rasterSize, 16.0f * uiScale);
+                ImFontConfig chineseFontConfig;
+                chineseFontConfig.MergeMode = true;
+                chineseFontConfig.PixelSnapH = true;
+                chineseFontConfig.FontNo = candidate.fontIndex;
+                chineseFontConfig.OversampleH = 1;
+                chineseFontConfig.OversampleV = 1;
+                if (!fonts->AddFontFromFileTTF(candidate.path, rasterSize, &chineseFontConfig, chineseGlyphRanges())) { break; }
                 if (!addLargeFonts()) { return false; }
                 // AddFontFromFileTTF only reads the file; unsupported vendor font
                 // tables are rejected when ImGui builds the atlas. Verify now,
                 // before the loading screen's first ImGui::NewFrame().
-                if (!fonts->Build() || !baseFont->FindGlyphNoFallback(0x4E2D)) {
+                if (!fonts->Build() || !baseFont->FindGlyphNoFallback(0x4E2D) ||
+                    (maxTextureSize > 0 && (fonts->TexWidth > maxTextureSize || fonts->TexHeight > maxTextureSize))) {
                     flog::warn("Cannot build Chinese glyphs from {0}; trying another font", candidate.path);
                     fonts->Clear();
                     if (!addBaseFont()) { return false; }
                     continue;
                 }
+                scaleChineseGlyphs(baseFont, 16.0f * uiScale / rasterSize);
                 chineseFontLoaded = true;
                 break;
             }
+            if (chineseFontLoaded) { break; }
         }
         if (!chineseFontLoaded) {
             flog::warn("No compatible Android Chinese fallback font found");
