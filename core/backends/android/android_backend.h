@@ -1,6 +1,7 @@
 #pragma once
 #include <vector>
 #include <stdint.h>
+#include <string>
 
 namespace backend {
     struct DevVIDPID {
@@ -15,4 +16,8 @@ namespace backend {
     extern const std::vector<DevVIDPID> RTL_SDR_VIDPIDS;
 
     int getDeviceFD(int& vid, int& pid, const std::vector<DevVIDPID>& allowedVidPids);
+    // Owned duplicate; caller must close after closing its native USB handle.
+    int acquireDeviceFD(int& vid, int& pid, const std::vector<DevVIDPID>& allowedVidPids);
+    void refreshUsbDevices();
+    std::string getUsbStatus();
 }

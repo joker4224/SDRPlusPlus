@@ -46,6 +46,8 @@ option(OPT_BUILD_NEW_PORTAUDIO_SINK "Build the new PortAudio Sink Module (Depend
 option(OPT_BUILD_PORTAUDIO_SINK "Build PortAudio Sink Module (Dependencies: portaudio)" OFF)
 
 # Decoders
+option(OPT_BUILD_ADSB_DECODER "Build the native 1090 MHz ADS-B decoder (no extra dependencies)" OFF)
+option(OPT_BUILD_ADSB_TESTS "Build ADS-B decoder regression tests" OFF)
 option(OPT_BUILD_ATV_DECODER "Build ATV decoder (no dependencies required)" ON)
 option(OPT_BUILD_DAB_DECODER "Build the DAB/DAB+ decoder (no dependencies required)" OFF)
 option(OPT_BUILD_FALCON9_DECODER "Build the falcon9 live decoder (Dependencies: ffplay)" OFF)
@@ -264,6 +266,13 @@ endif (OPT_BUILD_NEW_PORTAUDIO_SINK)
 
 
 # Decoders
+if (OPT_BUILD_ADSB_DECODER)
+    if (OPT_BUILD_ADSB_TESTS)
+        enable_testing()
+    endif()
+    add_subdirectory("decoder_modules/adsb_decoder")
+endif()
+
 if (OPT_BUILD_ATV_DECODER)
 add_subdirectory("decoder_modules/atv_decoder")
 endif (OPT_BUILD_ATV_DECODER)

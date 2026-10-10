@@ -36,7 +36,9 @@ namespace backend {
     void doPartialInit() {
         std::string root = (std::string)core::args["root"];
         backend::init();
-        style::loadFonts(root + "/res"); // TODO: Don't hardcode, use config
+        GLint maxTextureSize = 0;
+        glGetIntegerv(GL_MAX_TEXTURE_SIZE, &maxTextureSize);
+        style::loadFonts(root + "/res", maxTextureSize); // TODO: Don't hardcode, use config
         icons::load(root + "/res");
         thememenu::applyTheme();
         ImGui::GetStyle().ScaleAllSizes(style::uiScale);
@@ -281,51 +283,88 @@ namespace backend {
         return result;
     }
 
-    int getDeviceFD(int& vid, int& pid, const std::vector<DevVIDPID>& allowedVidPids) {
-        JavaVM* java_vm = app->activity->vm;
-        JNIEnv* java_env = NULL;
+    namespace {
+        // Restore the caller's JNI attachment state and release every local ref.
+        struct UsbJNI {
+            JavaVM* vm = nullptr;
+            JNIEnv* env = nullptr;
+            bool detach = false, frame = false;
+            UsbJNI() {
+                if (!app || !app->activity) { return; }
+                vm = app->activity->vm;
+                jint result = vm->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION_1_6);
+                if (result == JNI_EDETACHED) {
+                    if (vm->AttachCurrentThread(&env, nullptr) != JNI_OK) { env = nullptr; return; }
+                    detach = true;
+                }
+                else if (result != JNI_OK) { env = nullptr; return; }
+                if (env->PushLocalFrame(16) < 0) { env->ExceptionClear(); env = nullptr; return; }
+                frame = true;
+            }
+            ~UsbJNI() {
+                if (env && env->ExceptionCheck()) { env->ExceptionClear(); }
+                if (frame) { env->PopLocalFrame(nullptr); }
+                if (detach) { vm->DetachCurrentThread(); }
+            }
+        };
 
-        jint jni_return = java_vm->GetEnv((void**)&java_env, JNI_VERSION_1_6);
-        if (jni_return == JNI_ERR)
-            return -1;
-
-        jni_return = java_vm->AttachCurrentThread(&java_env, NULL);
-        if (jni_return != JNI_OK)
-            return -1;
-
-        jclass native_activity_clazz = java_env->GetObjectClass(app->activity->clazz);
-        if (native_activity_clazz == NULL)
-            return -1;
-
-        jfieldID fd_field_id = java_env->GetFieldID(native_activity_clazz, "SDR_FD", "I");
-        jfieldID vid_field_id = java_env->GetFieldID(native_activity_clazz, "SDR_VID", "I");
-        jfieldID pid_field_id = java_env->GetFieldID(native_activity_clazz, "SDR_PID", "I");
-        
-        if (!vid_field_id || !vid_field_id || !pid_field_id)
-            return -1;
-
-        int fd = java_env->GetIntField(app->activity->clazz, fd_field_id);
-        vid = java_env->GetIntField(app->activity->clazz, vid_field_id);
-        pid = java_env->GetIntField(app->activity->clazz, pid_field_id);
-
-        jni_return = java_vm->DetachCurrentThread();
-        if (jni_return != JNI_OK)
-            return -1;
-
-        // If no vid/pid was given, just return successfully
-        if (allowedVidPids.empty()) {
-            return fd;
+        int deviceFD(int& vid, int& pid, const std::vector<DevVIDPID>& allowed, bool duplicate) {
+            vid = pid = -1;
+            UsbJNI jni;
+            if (!jni.env) { return -1; }
+            JNIEnv* env = jni.env;
+            jclass clazz = env->GetObjectClass(app->activity->clazz);
+            if (!clazz) { return -1; }
+            jmethodID method = env->GetMethodID(clazz, "getUsbDeviceInfo", "([IZ)[I");
+            if (!method) { return -1; }
+            std::vector<jint> pairs;
+            for (const auto& item : allowed) { pairs.push_back(item.vid); pairs.push_back(item.pid); }
+            jintArray filter = env->NewIntArray(static_cast<jsize>(pairs.size()));
+            if (!filter) { return -1; }
+            if (!pairs.empty()) { env->SetIntArrayRegion(filter, 0, pairs.size(), pairs.data()); }
+            if (env->ExceptionCheck()) { return -1; }
+            auto info = static_cast<jintArray>(env->CallObjectMethod(app->activity->clazz, method, filter, duplicate ? JNI_TRUE : JNI_FALSE));
+            if (env->ExceptionCheck() || !info || env->GetArrayLength(info) != 3) { return -1; }
+            jint values[3];
+            env->GetIntArrayRegion(info, 0, 3, values);
+            if (env->ExceptionCheck() || values[0] < 0) { return -1; }
+            vid = values[1]; pid = values[2];
+            return values[0];
         }
-
-        // Otherwise, check that the vid/pid combo is allowed
-        for (auto const& vp : allowedVidPids) {
-            if (vp.vid != vid || vp.pid != pid) { continue; }
-            return fd;
-        }
-
-        return -1;
     }
 
+    int getDeviceFD(int& vid, int& pid, const std::vector<DevVIDPID>& allowedVidPids) {
+        return deviceFD(vid, pid, allowedVidPids, false);
+    }
+
+    int acquireDeviceFD(int& vid, int& pid, const std::vector<DevVIDPID>& allowedVidPids) {
+        return deviceFD(vid, pid, allowedVidPids, true);
+    }
+
+    void refreshUsbDevices() {
+        UsbJNI jni;
+        if (!jni.env) { return; }
+        jclass clazz = jni.env->GetObjectClass(app->activity->clazz);
+        if (!clazz) { return; }
+        jmethodID method = jni.env->GetMethodID(clazz, "refreshUsbDevices", "()V");
+        if (method) { jni.env->CallVoidMethod(app->activity->clazz, method); }
+    }
+
+    std::string getUsbStatus() {
+        UsbJNI jni;
+        if (!jni.env) { return "USB service unavailable"; }
+        jclass clazz = jni.env->GetObjectClass(app->activity->clazz);
+        if (!clazz) { return "USB service unavailable"; }
+        jmethodID method = jni.env->GetMethodID(clazz, "getUsbStatus", "()Ljava/lang/String;");
+        if (!method) { return "USB service unavailable"; }
+        auto message = static_cast<jstring>(jni.env->CallObjectMethod(app->activity->clazz, method));
+        if (jni.env->ExceptionCheck() || !message) { return "USB service unavailable"; }
+        const char* text = jni.env->GetStringUTFChars(message, nullptr);
+        if (!text) { return "USB service unavailable"; }
+        std::string status(text);
+        jni.env->ReleaseStringUTFChars(message, text);
+        return status;
+    }
     // Unfortunately, the native KeyEvent implementation has no getUnicodeChar() function.
     // Therefore, we implement the processing of KeyEvents in MainActivity.kt and poll
     // the resulting Unicode characters here via JNI and send them to Dear ImGui.
